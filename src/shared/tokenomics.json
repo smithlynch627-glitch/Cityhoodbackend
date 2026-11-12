@@ -1,0 +1,18 @@
+{
+  "_note": "Launch tokenomics. Used by contracts/scripts/deploy.ts and shown on the site. Amounts are whole $CITY.",
+  "symbol": "CITY",
+  "totalSupply": 500000000,
+  "allocations": [
+    { "key": "mining", "label": "Mining rewards", "amount": 300000000, "color": "#4fb436", "note": "Pays land earnings every hour. Half of every build cost flows back in, half is burned." },
+    { "key": "sale", "label": "Token sale", "amount": 100000000, "color": "#ffb424", "note": "Sold on Grab Land at a fixed price. Every 5,000 bought is one Land activation key." },
+    { "key": "liquidity", "label": "Liquidity", "amount": 50000000, "color": "#4fb4e3", "note": "Paired with ETH on Uniswap V2 at launch." },
+    { "key": "airdrop", "label": "Land holder airdrop", "amount": 25000000, "color": "#8c6ce0", "note": "5,000 $CITY to every Land when it is activated." },
+    { "key": "treasury", "label": "Treasury", "amount": 15000000, "color": "#ff6b57", "note": "Partnerships, events and community rewards." },
+    { "key": "team", "label": "Team (locked)", "amount": 10000000, "color": "#8094b0", "note": "Locked for 3 months, then unlocks gradually until month 12." }
+  ],
+  "sale": { "packSize": 5000, "packPriceEth": "0.0009", "packPriceUsdg": "2", "maxPerWallet": 30000, "landsPerWallet": 3 },
+  "usdg": { "decimals": 6, "testnet": "0x7E955252E15c84f5768B83c41a71F9eba181802F", "mainnet": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168" },
+  "tax": { "buyBps": 300, "sellBps": 500, "maxBps": 1000 },
+  "land": { "maxSupply": 5000, "reserve": 50, "royaltyBps": 500 },
+  "team": { "cliffDays": 90, "durationDays": 365 }
+}
