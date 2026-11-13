@@ -98,7 +98,7 @@ app.get('/api/config', (_req, res) => {
 app.get(
   '/api/site',
   wrap(async (_req, res) => {
-    res.set('Cache-Control', 'public, max-age=20').json(publicSettings(await getSettings()));
+    res.set('Cache-Control', 'public, max-age=10').json(publicSettings(await getSettings()));
   }),
 );
 

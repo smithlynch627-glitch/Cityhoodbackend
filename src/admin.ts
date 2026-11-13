@@ -2,8 +2,9 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { getAddress, isAddress } from 'viem';
 import { db } from './db';
-import { ADMIN_TOKEN, CHAIN, CITY_ADDRESS, GAME_ADDRESS, LAND_ADDRESS, SALE_ADDRESS } from './config';
-import { getSettings, grabPhase, updateSettings, DEFAULTS, type Settings } from './settings';
+import { ADMIN_IPS, ADMIN_TOKEN, ADMIN_TOTP_SECRET, CHAIN, CITY_ADDRESS, GAME_ADDRESS, LAND_ADDRESS, SALE_ADDRESS } from './config';
+import { checkTotp, newTotpSecret, otpauthUrl } from './totp';
+import { getSettings, grabPhase, updateSettings, DEFAULTS, VISIBILITY_KEYS, type Settings } from './settings';
 import { generateCodes, normCode, type GrabCode } from './codes';
 import { setStatus, TASK_KINDS, LINK_KINDS, type Submission, type Task, type User, type UserStatus } from './citizens';
 import { getTokenomics } from './market';
@@ -37,31 +38,70 @@ export function requireAdmin(req: Request, _res: Response, next: NextFunction) {
     .catch(next);
 }
 
+/** With ADMIN_IPS set, the admin API simply doesn't exist for anyone else. */
+const allowedIps = new Set(ADMIN_IPS.map((ip) => clientIp({ headers: {}, socket: { remoteAddress: ip }, ip } as unknown as Request)));
+function ipAllowed(req: Request) {
+  return !allowedIps.size || allowedIps.has(clientIp(req));
+}
+/** the last 2-step code used, so a code seen over someone's shoulder can't be used again */
+let lastTotpStep = 0;
+
+/** What the sign-in form needs to show (no secrets). */
+admin.get('/api/admin/auth-info', (req, res) => {
+  if (!ipAllowed(req)) return res.status(404).json({ error: 'Not found.' });
+  res.set('Cache-Control', 'no-store').json({ enabled: !!ADMIN_TOKEN, otp: !!ADMIN_TOTP_SECRET });
+});
+
 admin.post(
   '/api/admin/login',
   wrap(async (req, res) => {
+    if (!ipAllowed(req)) throw notFound();
     if (!ADMIN_TOKEN) throw new HttpError(503, 'Admin is disabled. Set ADMIN_TOKEN on the server.');
     const key = `adminlogin:${clientIp(req)}`;
     // per IP, and across all IPs so a botnet can't guess either
     if (!allow(key, 6, 15 * 60_000)) throw new HttpError(429, `Too many attempts. Try again in ${Math.ceil(retryAfter(key) / 60)} min.`);
     if (!allow('adminlogin:all', 60, 15 * 60_000)) throw new HttpError(429, 'Sign-in is cooling down. Try again in a few minutes.');
     await new Promise((r) => setTimeout(r, 350 + Math.random() * 250));
-    if (!safeEqual(str(req.body?.password, 500), ADMIN_TOKEN)) {
-      await db.insert('audit', { actor: 'admin', action: 'login.failed', detail: { ip: clientIp(req) } }).catch(() => {});
-      throw unauthorized('Wrong password.');
+    const passOk = safeEqual(str(req.body?.password, 500), ADMIN_TOKEN);
+    // check the 2-step code even when the password is wrong, so the answer never tells which one failed
+    const step = ADMIN_TOTP_SECRET ? checkTotp(ADMIN_TOTP_SECRET, str(req.body?.otp, 12)) : 0;
+    const otpOk = !ADMIN_TOTP_SECRET || (step !== null && step > lastTotpStep);
+    if (!passOk || !otpOk) {
+      await db.insert('audit', { actor: 'admin', action: 'login.failed', detail: { ip: clientIp(req), ua: str(req.headers['user-agent'], 120) } }).catch(() => {});
+      throw unauthorized(ADMIN_TOTP_SECRET ? 'Wrong password or 2-step code.' : 'Wrong password.');
     }
+    if (ADMIN_TOTP_SECRET && step) lastTotpStep = step;
     const s = await getSettings(true);
-    await db.insert('audit', { actor: 'admin', action: 'login', detail: { ip: clientIp(req), ua: str(req.headers['user-agent'], 120) } }).catch(() => {});
+    await db.insert('audit', { actor: 'admin', action: 'login', detail: { ip: clientIp(req), ua: str(req.headers['user-agent'], 120), otp: !!ADMIN_TOTP_SECRET } }).catch(() => {});
     res.set('Cache-Control', 'no-store').json({ token: signToken('admin', { a: 1, e: s.admin_epoch }, SESSION_TTL), expiresIn: SESSION_TTL });
   }),
 );
 
 admin.use('/api/admin', (req, res, next) => {
-  if (req.path === '/login') return next();
-  res.set('Cache-Control', 'no-store');
+  res.set('Cache-Control', 'no-store').set('X-Robots-Tag', 'noindex, nofollow');
+  if (!ipAllowed(req)) return next(notFound());
+  if (req.path === '/login' || req.path === '/auth-info') return next();
   if (!allow(`admin:${clientIp(req)}`, 600, 60_000)) return next(new HttpError(429, 'Too many admin requests. Slow down.'));
   requireAdmin(req, res, next);
 });
+
+/** 2-step sign-in helper: makes a fresh secret to add to an authenticator app. Nothing is stored. */
+admin.post(
+  '/api/admin/2fa/new',
+  wrap(async (_req, res) => {
+    const secret = newTotpSecret();
+    res.json({ secret, otpauth: otpauthUrl(secret, 'admin'), enabled: !!ADMIN_TOTP_SECRET });
+  }),
+);
+/** Checks a code against a secret before it is put on the server (so a typo can't lock you out). */
+admin.post(
+  '/api/admin/2fa/check',
+  wrap(async (req, res) => {
+    const secret = str(req.body?.secret, 64).replace(/\s+/g, '').toUpperCase();
+    if (!/^[A-Z2-7]{16,64}$/.test(secret)) throw bad('That is not a valid key.');
+    res.json({ ok: checkTotp(secret, str(req.body?.code, 12)) !== null });
+  }),
+);
 
 /** Ends every admin session (all devices), including this one. */
 admin.post(
@@ -101,6 +141,8 @@ admin.get(
         xApi: X_API_READY,
         voucherSigner: signerAddress(),
         weakAdminPassword: ADMIN_TOKEN.length < 16,
+        twoStep: !!ADMIN_TOTP_SECRET,
+        ipLock: ADMIN_IPS.length > 0,
         chainId: CHAIN.id,
         contracts: { land: LAND_ADDRESS ?? null, city: CITY_ADDRESS ?? null, game: GAME_ADDRESS ?? null, sale: SALE_ADDRESS ?? null },
       },
@@ -135,6 +177,12 @@ admin.put(
     flag('auto_code_for_citizens');
     flag('citizen_wallet_is_code');
     flag('grab_enabled');
+    for (const k of VISIBILITY_KEYS) {
+      if (!(k in b)) continue;
+      const v = String(b[k]);
+      if (v !== 'auto' && v !== 'show' && v !== 'hide') throw bad(`${k} must be auto, show or hide.`);
+      patch[k] = v;
+    }
     text('share_text', 240);
     text('grab_message', 240);
     if ('referral_points' in b) patch.referral_points = int(b.referral_points, 50, 0, 100000);

@@ -53,6 +53,10 @@ export const CORS_ORIGIN = (env.CORS_ORIGIN || '')
 
 /** Admin password for the admin panel and admin API. Leave empty to disable admin routes. */
 export const ADMIN_TOKEN = env.ADMIN_TOKEN || '';
+/** Optional 2-step sign-in: a base32 authenticator-app secret. When set, admin sign-in also needs the 6-digit code. */
+export const ADMIN_TOTP_SECRET = (env.ADMIN_TOTP_SECRET || '').replace(/\s+/g, '').toUpperCase();
+/** Optional: only these IPs (comma separated) can reach the admin API at all. Everyone else gets "not found". */
+export const ADMIN_IPS = (env.ADMIN_IPS || '').split(',').map((s) => s.trim()).filter(Boolean);
 
 /** Signs user and admin sessions. Required in production; a random one is used locally (sessions reset on restart). */
 export const SESSION_SECRET = env.SESSION_SECRET || '';

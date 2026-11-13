@@ -31,7 +31,21 @@ export interface Settings {
   grab_message: string;
   /** Bumped by "sign out all admin sessions": every admin token issued before stops working. */
   admin_epoch: number;
+
+  /*
+   * What visitors can see before launch. 'auto' follows the Grab Land timer, 'show' / 'hide' override it.
+   * show_grab: the Grab Land page, its menu link and every "Grab a land" button (auto: once a timer is set)
+   * show_contracts: contract addresses and explorer links (auto: once a timer is set)
+   * show_wallet: the Connect wallet button (auto: once a timer is set)
+   * show_progress: the "islands minted" progress bar (auto: once code holders can enter)
+   */
+  show_grab: Visibility;
+  show_contracts: Visibility;
+  show_wallet: Visibility;
+  show_progress: Visibility;
 }
+export type Visibility = 'auto' | 'show' | 'hide';
+export const VISIBILITY_KEYS = ['show_grab', 'show_contracts', 'show_wallet', 'show_progress'] as const;
 
 export const DEFAULTS: Settings = {
   x_handle: X_HANDLE,
@@ -56,6 +70,10 @@ export const DEFAULTS: Settings = {
   grab_public_opens_at: null,
   grab_message: 'Grab Land opens soon. Code holders get in first.',
   admin_epoch: 0,
+  show_grab: 'auto',
+  show_contracts: 'auto',
+  show_wallet: 'auto',
+  show_progress: 'auto',
 };
 
 let cache: { at: number; value: Settings } | null = null;
@@ -109,6 +127,26 @@ export function publicSettings(s: Settings) {
     referral_points: s.referral_points,
     milestones: s.milestones,
     share_text: s.share_text,
+    reveal: siteReveal(s),
+  };
+}
+
+/**
+ * What the website shows right now. Hiding is about what visitors see; buying is separately protected by the
+ * server (no buy pass before Grab Land opens), so a hidden page can't be used to buy early.
+ */
+export function siteReveal(s: Settings, now = Date.now()) {
+  const g = grabPhase(s, now);
+  const timerSet = !!g.code_opens_at; // countdown, open, or paused with times kept
+  const live = g.phase === 'code' || g.phase === 'public';
+  const pick = (v: Visibility, auto: boolean) => (v === 'show' ? true : v === 'hide' ? false : auto);
+  return {
+    grab: pick(s.show_grab, timerSet),
+    contracts: pick(s.show_contracts, timerSet),
+    wallet: pick(s.show_wallet, timerSet),
+    progress: pick(s.show_progress, live),
+    /** when the progress bar turns on by itself (auto + countdown), so pages can flip at the exact moment */
+    progress_at: s.show_progress === 'auto' && g.phase === 'countdown' ? g.code_opens_at : null,
   };
 }
 
