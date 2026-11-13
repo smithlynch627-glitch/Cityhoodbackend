@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { getAddress, isAddress } from 'viem';
 import { db } from './db';
+import { TtlCache } from './cache';
 import { IS_PROD, PUBLIC_API_URL, SITE_URL } from './config';
 import { getSettings, publicSettings, type Settings } from './settings';
 import { generateCodes } from './codes';
@@ -33,7 +34,7 @@ export interface User {
   created_at: string;
   updated_at?: string;
 }
-export type TaskKind = 'follow' | 'like' | 'repost' | 'engage' | 'quote' | 'reply' | 'post' | 'art' | 'daily' | 'custom';
+export type TaskKind = 'follow' | 'like' | 'repost' | 'engage' | 'quote' | 'reply' | 'post' | 'art' | 'daily' | 'visit' | 'custom';
 export type VerifyMode = 'auto' | 'review' | 'x_api';
 export interface Task {
   id: string;
@@ -67,7 +68,7 @@ export interface Submission {
   updated_at?: string;
 }
 
-export const TASK_KINDS: TaskKind[] = ['follow', 'like', 'repost', 'engage', 'quote', 'reply', 'post', 'art', 'daily', 'custom'];
+export const TASK_KINDS: TaskKind[] = ['follow', 'like', 'repost', 'engage', 'quote', 'reply', 'post', 'art', 'daily', 'visit', 'custom'];
 export const LINK_KINDS: TaskKind[] = ['quote', 'reply', 'post', 'art'];
 
 /* ================================================================== helpers */
@@ -85,9 +86,22 @@ async function requireUser(req: Request) {
   return u;
 }
 
-async function rankOf(points: number) {
-  if (points <= 0) return 0;
-  return (await db.count('users', { points: { gt: points }, status: { neq: 'banned' } })) + 1;
+/* Short shared caches keep the dashboard cheap when thousands of people have it open at once. */
+const ranks = new TtlCache<number>(5000);
+const refInfo = new TtlCache<{ count: number; applied: { code: string; referrer_id: string } | null; referrer: string | null }>(20000);
+
+function rankOf(points: number) {
+  if (points <= 0) return Promise.resolve(0);
+  // everyone with the same points has the same rank, so this is shared between them
+  return ranks.get(String(points), 20_000, async () => (await db.count('users', { points: { gt: points }, status: { neq: 'banned' } })) + 1);
+}
+
+function referralInfo(userId: string) {
+  return refInfo.get(userId, 30_000, async () => {
+    const [count, applied] = await Promise.all([db.count('referrals', { referrer_id: userId }), db.one<{ code: string; referrer_id: string }>('referrals', { referee_id: userId })]);
+    const referrer = applied ? ((await db.one<User>('users', { id: applied.referrer_id }))?.username ?? null) : null;
+    return { count, applied, referrer };
+  });
 }
 
 async function uniqueReferralCode() {
@@ -100,12 +114,9 @@ async function uniqueReferralCode() {
 
 export async function profileOf(u: User, s?: Settings) {
   s ??= await getSettings();
-  const [rank, referralCount, applied] = await Promise.all([
-    rankOf(u.points),
-    db.count('referrals', { referrer_id: u.id }),
-    db.one<{ code: string; referrer_id: string }>('referrals', { referee_id: u.id }),
-  ]);
-  const referrer = applied ? await db.one<User>('users', { id: applied.referrer_id }) : null;
+  const [rank, ref] = await Promise.all([rankOf(u.points), referralInfo(u.id)]);
+  const referralCount = ref.count;
+  const applied = ref.applied;
   return {
     id: u.id,
     username: u.username,
@@ -117,7 +128,7 @@ export async function profileOf(u: User, s?: Settings) {
     referral_count: referralCount,
     referral_points: s.referral_points,
     milestones: s.milestones.map((m) => ({ ...m, reached: referralCount >= m.need })),
-    applied_referral: applied ? { code: applied.code, username: referrer?.username ?? 'someone' } : null,
+    applied_referral: applied ? { code: applied.code, username: ref.referrer ?? 'someone' } : null,
     wallet_address: u.wallet_address,
     wallet_edits_open: s.wallet_edits_open,
     registration_open: s.citizenship_open,
@@ -155,12 +166,18 @@ export async function applyReferral(user: User, code: string, s: Settings) {
   const clean = code.trim().toUpperCase();
   if (!/^[A-Z0-9]{6}$/.test(clean)) throw bad('Refer codes are 6 letters and numbers.');
   if (clean === user.referral_code) throw bad('You cannot use your own refer code.');
+  // stop farming with fresh throwaway X accounts
+  const days = user.account_created_at ? (Date.now() - Date.parse(user.account_created_at)) / 86_400_000 : Infinity;
+  if (s.referral_min_account_days > 0 && days < s.referral_min_account_days) throw bad(`Refer codes need an X account at least ${s.referral_min_account_days} days old.`);
+  if (s.referral_min_followers > 0 && user.followers !== null && user.followers < s.referral_min_followers) throw bad(`Refer codes need an X account with at least ${s.referral_min_followers} followers.`);
   if (await db.one('referrals', { referee_id: user.id })) throw bad('You already used a refer code.');
   const ref = await db.one<User>('users', { referral_code: clean });
   if (!ref || ref.status === 'banned') throw bad('That refer code does not exist.');
   if (ref.referred_by === user.id) throw bad('You two already referred each other the other way round.');
   try {
     await db.insert('referrals', { referrer_id: ref.id, referee_id: user.id, code: clean, points: s.referral_points });
+    refInfo.delete(ref.id);
+    refInfo.delete(user.id);
   } catch {
     throw bad('You already used a refer code.');
   }
@@ -444,22 +461,25 @@ citizens.post(
   }),
 );
 
-let lbCache: { at: number; rows: unknown[] } | null = null;
+const shared = new TtlCache<unknown>(10);
 citizens.get(
   '/api/citizen/leaderboard',
   wrap(async (_req, res) => {
-    if (!lbCache || Date.now() - lbCache.at > 20_000) {
-      const rows = await db.select<User>('users', { where: { points: { gt: 0 }, status: { neq: 'banned' } }, order: [['points', 'desc'], ['created_at', 'asc']], limit: 1000 });
-      lbCache = { at: Date.now(), rows: rows.map((r, i) => ({ rank: i + 1, username: r.username, avatar_url: r.avatar_url, points: r.points, citizen: r.status === 'citizen' })) };
-    }
-    res.set('Cache-Control', 'public, max-age=15').json({ rows: lbCache.rows });
+    const rows = await shared.get('lb', 20_000, async () => {
+      const list = await db.select<User>('users', { where: { points: { gt: 0 }, status: { neq: 'banned' } }, order: [['points', 'desc'], ['created_at', 'asc']], limit: 1000 });
+      return list.map((r, i) => ({ rank: i + 1, username: r.username, avatar_url: r.avatar_url, points: r.points, citizen: r.status === 'citizen' }));
+    });
+    res.set('Cache-Control', 'public, max-age=15').json({ rows });
   }),
 );
 
 citizens.get(
   '/api/citizen/stats',
   wrap(async (_req, res) => {
-    const [users, citizensN] = await Promise.all([db.count('users'), db.count('users', { status: 'citizen' })]);
-    res.set('Cache-Control', 'public, max-age=30').json({ users, citizens: citizensN });
+    const out = await shared.get('stats', 30_000, async () => {
+      const [users, citizensN] = await Promise.all([db.count('users'), db.count('users', { status: 'citizen' })]);
+      return { users, citizens: citizensN };
+    });
+    res.set('Cache-Control', 'public, max-age=30').json(out);
   }),
 );

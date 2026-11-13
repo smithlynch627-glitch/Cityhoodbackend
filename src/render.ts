@@ -1,4 +1,4 @@
-import { Resvg } from '@resvg/resvg-js';
+import { Resvg, renderAsync } from '@resvg/resvg-js';
 import { renderScene, type SceneBuilding } from './shared/art';
 import { DEFAULT_CATALOG, developmentOf, simulate, typeById, type ChainLand } from './shared/economy';
 
@@ -31,6 +31,15 @@ export function landSvg(landId: number, land: ChainLand | null, now: number, ani
 
 /** Square PNG for marketplaces / wallets that don't render SVG. */
 export function landPng(svg: string, size = 1000): Buffer {
+  return new Resvg(squareSvg(svg), { fitTo: { mode: 'width', value: size }, background: '#9fd8e6', font: { loadSystemFonts: true } }).render().asPng();
+}
+
+/** Same as landPng, rendered on a worker thread so the API keeps answering while it draws. */
+export async function landPngAsync(svg: string, size = 1000): Promise<Buffer> {
+  return (await renderAsync(squareSvg(svg), { fitTo: { mode: 'width', value: size }, background: '#9fd8e6', font: { loadSystemFonts: true } })).asPng();
+}
+
+function squareSvg(svg: string): string {
   // make the scene square: wrap the viewBox in a square sky canvas
   const m = svg.match(/viewBox="([-\d.]+) ([-\d.]+) ([\d.]+) ([\d.]+)"/);
   let squared = svg;
@@ -45,8 +54,7 @@ export function landPng(svg: string, size = 1000): Buffer {
         r.replace(/x="[-\d.]+" y="[-\d.]+" width="[\d.]+" height="[\d.]+"/, `x="${nx}" y="${ny}" width="${side}" height="${side}"`),
       );
   }
-  const r = new Resvg(squared, { fitTo: { mode: 'width', value: size }, background: '#9fd8e6', font: { loadSystemFonts: true } });
-  return r.render().asPng();
+  return squared;
 }
 
 /** Share of the 16×16 island covered by buildings (0–100). */

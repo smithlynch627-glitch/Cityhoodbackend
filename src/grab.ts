@@ -7,7 +7,7 @@ import { CHAIN, SALE_ADDRESS, SALE_SIGNER_KEY, VOUCHER_MINUTES, SITE_URL } from 
 import { getSettings, grabPhase } from './settings';
 import { normCode, type GrabCode } from './codes';
 import type { User } from './citizens';
-import { allow, bad, bearer, clientIp, forbidden, HttpError, randomToken, rateLimit, retryAfter, signToken, str, unauthorized, verifyToken, wrap } from './security';
+import { allow, bad, bearer, clientIp, forbidden, hits, HttpError, randomToken, rateLimit, retryAfter, signToken, str, unauthorized, verifyToken, wrap } from './security';
 
 const signer = /^0x[0-9a-fA-F]{64}$/.test(SALE_SIGNER_KEY) ? privateKeyToAccount(SALE_SIGNER_KEY as Hex) : null;
 if (!signer) console.warn('[grab] SALE_SIGNER_PRIVATE_KEY is missing — sale vouchers are disabled.');
@@ -42,11 +42,26 @@ async function steady<T>(fn: () => Promise<T>, ms = 400): Promise<T> {
   }
 }
 
+/**
+ * Brute-force protection for 6-digit codes. Only WRONG codes count towards the tight limits, so a rush of real
+ * code holders (thousands at opening time, many sharing one mobile-network IP) is never blocked, while guessing
+ * stops fast: 15 wrong codes per IP per 10 min, and a global brake if wrong codes pour in from many IPs.
+ */
+const WINDOW = 10 * 60_000;
 function codeGuard(req: Request) {
-  // brute-force protection: 12 code lookups per IP per 10 minutes, 2,000 per 10 minutes globally
   const ip = clientIp(req);
-  if (!allow(`code:${ip}`, 12, 10 * 60_000)) throw new HttpError(429, `Too many code checks. Try again in ${Math.ceil(retryAfter(`code:${ip}`) / 60)} min.`);
-  if (!allow('code:global', 2000, 10 * 60_000)) throw new HttpError(429, 'The code checker is busy. Try again in a few minutes.');
+  if (hits(`codefail:${ip}`) >= 15) throw new HttpError(429, `Too many wrong codes. Try again in ${Math.max(1, Math.ceil(retryAfter(`codefail:${ip}`) / 60))} min.`);
+  if (!allow(`code:${ip}`, 150, WINDOW)) throw new HttpError(429, `Too many code checks. Try again in ${Math.max(1, Math.ceil(retryAfter(`code:${ip}`) / 60))} min.`);
+  if (hits('codefail:global') >= 6000) throw new HttpError(429, 'The code checker is busy. Try again in a few minutes.');
+}
+function codeFailed(req: Request) {
+  allow(`codefail:${clientIp(req)}`, Number.MAX_SAFE_INTEGER, WINDOW);
+  allow('codefail:global', Number.MAX_SAFE_INTEGER, WINDOW);
+}
+/** per-wallet limit on top of the (generous, NAT-friendly) per-IP one */
+function walletLimit(name: string, wallet: string, limit: number) {
+  const key = `${name}:${wallet.toLowerCase()}`;
+  if (!allow(key, limit, WINDOW)) throw new HttpError(429, `Too many requests for this wallet. Try again in ${Math.max(1, Math.ceil(retryAfter(key) / 60))} min.`);
 }
 
 export const grab = Router();
@@ -75,7 +90,10 @@ grab.post(
       const code = normCode(input);
       if (code.length !== 6) return { valid: false, kind: 'code', message: 'Codes are 6 digits.' };
       const row = await db.one<GrabCode>('grab_codes', { code });
-      if (!row || row.status === 'revoked') return { valid: false, kind: 'code', message: "That code doesn't exist." };
+      if (!row || row.status === 'revoked') {
+        codeFailed(req);
+        return { valid: false, kind: 'code', message: "That code doesn't exist." };
+      }
       if (row.status === 'claimed') return { valid: true, kind: 'code', used: true, message: `This code is valid and already linked to wallet ${short(row.wallet ?? '')}. Only that wallet can enter with it.` };
       return { valid: true, kind: 'code', used: false, message: 'Valid code. It links to the first wallet that enters with it.' };
     });
@@ -86,7 +104,7 @@ grab.post(
 /** Message to sign: proves you own the wallet. Free, no transaction. */
 grab.get(
   '/api/grab/challenge',
-  rateLimit('gchal', 60, 10 * 60_000),
+  rateLimit('gchal', 600, 10 * 60_000),
   wrap(async (req, res) => {
     const raw = str(req.query.address, 64);
     if (!isAddress(raw, { strict: false })) throw bad('Connect a wallet first.');
@@ -102,7 +120,7 @@ grab.get(
 /** Enter Grab Land: wallet signature + (during the code phase) a code or a listed wallet. */
 grab.post(
   '/api/grab/enter',
-  rateLimit('genter', 30, 10 * 60_000),
+  rateLimit('genter', 300, 10 * 60_000),
   wrap(async (req, res) => {
     const ch = verifyToken<{ k: string; a: Address; m: string }>('grab', str(req.body?.challenge, 4000));
     if (!ch || ch.k !== 'ch') throw unauthorized('Your sign-in expired. Try again.');
@@ -113,6 +131,7 @@ grab.post(
     if (!ok) throw unauthorized("That signature doesn't match your wallet.");
     const address = ch.a;
     const lower = address.toLowerCase();
+    walletLimit('genter', address, 20);
 
     const s = await getSettings();
     const g = grabPhase(s);
@@ -133,7 +152,10 @@ grab.post(
         const [claimed] = await db.update<GrabCode>('grab_codes', { code, status: 'unused' }, { status: 'claimed', wallet: lower, claimed_at: new Date().toISOString() });
         if (!claimed) {
           const row = await db.one<GrabCode>('grab_codes', { code });
-          if (!row || row.status === 'revoked') throw forbidden("That code doesn't exist.");
+          if (!row || row.status === 'revoked') {
+            codeFailed(req);
+            throw forbidden("That code doesn't exist.");
+          }
           if (row.wallet !== lower) throw forbidden(`That code is already linked to ${short(row.wallet ?? '')}. Enter with that wallet.`);
         }
         via = 'code';
@@ -166,9 +188,10 @@ grab.get(
 /** Short-lived EIP-712 voucher that lets this wallet call CitySale.buy. */
 grab.post(
   '/api/grab/voucher',
-  rateLimit('gvoucher', 60, 10 * 60_000),
+  rateLimit('gvoucher', 1200, 10 * 60_000),
   wrap(async (req, res) => {
     const a = await grabUser(req);
+    walletLimit('gvoucher', a, 60);
     if (!signer || !SALE_ADDRESS) throw new HttpError(503, 'The sale is not configured on the server yet.');
     const g = grabPhase(await getSettings());
     if (g.phase === 'locked' || g.phase === 'countdown') throw forbidden('Grab Land is closed right now.');

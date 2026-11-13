@@ -11,6 +11,10 @@ export interface Settings {
   citizenship_open: boolean;
   wallet_edits_open: boolean;
   referral_points: number;
+  /** anti-farming: X accounts younger than this (days) can't use a refer code */
+  referral_min_account_days: number;
+  /** anti-farming: X accounts with fewer followers can't use a refer code */
+  referral_min_followers: number;
   milestones: { need: number; bonus: number }[];
   /** Approving a citizen also issues them a personal 6-digit Grab Land code. */
   auto_code_for_citizens: boolean;
@@ -25,6 +29,8 @@ export interface Settings {
   /** When everyone may enter without a code (ISO time). */
   grab_public_opens_at: string | null;
   grab_message: string;
+  /** Bumped by "sign out all admin sessions": every admin token issued before stops working. */
+  admin_epoch: number;
 }
 
 export const DEFAULTS: Settings = {
@@ -35,6 +41,8 @@ export const DEFAULTS: Settings = {
   citizenship_open: true,
   wallet_edits_open: true,
   referral_points: 50,
+  referral_min_account_days: 14,
+  referral_min_followers: 3,
   milestones: [
     { need: 3, bonus: 100 },
     { need: 10, bonus: 400 },
@@ -47,17 +55,35 @@ export const DEFAULTS: Settings = {
   grab_code_opens_at: null,
   grab_public_opens_at: null,
   grab_message: 'Grab Land opens soon. Code holders get in first.',
+  admin_epoch: 0,
 };
 
 let cache: { at: number; value: Settings } | null = null;
+let loading: Promise<Settings> | null = null;
+/** bumped on every write, so a read that started before the write can't put old values back in the cache */
+let gen = 0;
 
+/** Settings, read from the database at most every 5 s; concurrent callers share one read. */
 export async function getSettings(fresh = false): Promise<Settings> {
   if (!fresh && cache && Date.now() - cache.at < 5_000) return cache.value;
-  const rows = await db.select<{ key: string; value: unknown }>('settings');
-  const value = { ...DEFAULTS } as Settings;
-  for (const r of rows) if (r.key in DEFAULTS) (value as unknown as Record<string, unknown>)[r.key] = r.value;
-  cache = { at: Date.now(), value };
-  return value;
+  if (!fresh && loading) return loading;
+  const g = gen;
+  const run = (async () => {
+    const rows = await db.select<{ key: string; value: unknown }>('settings');
+    const value = { ...DEFAULTS } as Settings;
+    for (const r of rows) if (r.key in DEFAULTS) (value as unknown as Record<string, unknown>)[r.key] = r.value;
+    if (g === gen) cache = { at: Date.now(), value };
+    return value;
+  })();
+  if (!fresh) loading = run;
+  try {
+    return await run;
+  } catch (e) {
+    if (cache) return cache.value; // database hiccup: keep the last known settings
+    throw e;
+  } finally {
+    if (loading === run) loading = null;
+  }
 }
 
 export async function updateSettings(patch: Partial<Settings>) {
@@ -65,7 +91,9 @@ export async function updateSettings(patch: Partial<Settings>) {
     .filter(([k]) => k in DEFAULTS)
     .map(([key, value]) => ({ key, value, updated_at: new Date().toISOString() }));
   if (rows.length) await db.upsert('settings', rows, 'key');
+  gen++;
   cache = null;
+  loading = null;
   return getSettings(true);
 }
 
@@ -99,6 +127,8 @@ export function grabPhase(s: Settings, now = Date.now()) {
   return {
     phase,
     enabled: s.grab_enabled,
+    /** switched off by the admin while a timer is set (times are kept for "Resume") */
+    paused: !s.grab_enabled && Number.isFinite(codeAt),
     code_opens_at: Number.isFinite(codeAt) ? new Date(codeAt).toISOString() : null,
     public_opens_at: Number.isFinite(publicAt) ? new Date(publicAt).toISOString() : null,
     message: s.grab_message,

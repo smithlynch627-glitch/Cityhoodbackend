@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { getAddress, isAddress } from 'viem';
 import { db } from './db';
@@ -12,17 +13,28 @@ import { allow, bad, bearer, bool, clientIp, forbidden, httpUrl, int, notFound, 
 
 export const admin = Router();
 const nowIso = () => new Date().toISOString();
+const SESSION_TTL = 8 * 3600;
+
+/** who is making the current admin request (for the log), carried through async calls */
+const reqCtx = new AsyncLocalStorage<{ ip: string; ua: string }>();
 
 async function audit(action: string, detail: Record<string, unknown> = {}) {
-  await db.insert('audit', { actor: 'admin', action, detail }).catch(() => {});
+  const who = reqCtx.getStore();
+  await db.insert('audit', { actor: 'admin', action, detail: who ? { ...detail, ip: who.ip, ua: who.ua } : detail }).catch(() => {});
 }
 
 /* ------------------------------------------------------------------ auth */
+/**
+ * Admin requests carry a signed, expiring session token (never the password itself). Tokens carry the current
+ * "epoch": "Sign out everywhere" bumps it, so every token issued before stops working at once.
+ */
 export function requireAdmin(req: Request, _res: Response, next: NextFunction) {
   if (!ADMIN_TOKEN) return next(new HttpError(503, 'Admin is disabled. Set ADMIN_TOKEN on the server.'));
-  const t = bearer(req);
-  if (t && (verifyToken('admin', t) || safeEqual(t, ADMIN_TOKEN))) return next();
-  next(unauthorized('Admin sign-in required.'));
+  const p = verifyToken<{ e?: number }>('admin', bearer(req));
+  if (!p) return next(unauthorized('Admin sign-in required.'));
+  getSettings()
+    .then((s) => ((p.e ?? 0) === s.admin_epoch ? reqCtx.run({ ip: clientIp(req), ua: str(req.headers['user-agent'], 120) }, () => next()) : next(unauthorized('Signed out. Sign in again.'))))
+    .catch(next);
 }
 
 admin.post(
@@ -30,15 +42,37 @@ admin.post(
   wrap(async (req, res) => {
     if (!ADMIN_TOKEN) throw new HttpError(503, 'Admin is disabled. Set ADMIN_TOKEN on the server.');
     const key = `adminlogin:${clientIp(req)}`;
+    // per IP, and across all IPs so a botnet can't guess either
     if (!allow(key, 6, 15 * 60_000)) throw new HttpError(429, `Too many attempts. Try again in ${Math.ceil(retryAfter(key) / 60)} min.`);
-    await new Promise((r) => setTimeout(r, 300));
-    if (!safeEqual(str(req.body?.password, 500), ADMIN_TOKEN)) throw unauthorized('Wrong password.');
-    await audit('login', { ip: clientIp(req) });
-    res.json({ token: signToken('admin', { a: 1 }, 12 * 3600), expiresIn: 12 * 3600 });
+    if (!allow('adminlogin:all', 60, 15 * 60_000)) throw new HttpError(429, 'Sign-in is cooling down. Try again in a few minutes.');
+    await new Promise((r) => setTimeout(r, 350 + Math.random() * 250));
+    if (!safeEqual(str(req.body?.password, 500), ADMIN_TOKEN)) {
+      await db.insert('audit', { actor: 'admin', action: 'login.failed', detail: { ip: clientIp(req) } }).catch(() => {});
+      throw unauthorized('Wrong password.');
+    }
+    const s = await getSettings(true);
+    await db.insert('audit', { actor: 'admin', action: 'login', detail: { ip: clientIp(req), ua: str(req.headers['user-agent'], 120) } }).catch(() => {});
+    res.set('Cache-Control', 'no-store').json({ token: signToken('admin', { a: 1, e: s.admin_epoch }, SESSION_TTL), expiresIn: SESSION_TTL });
   }),
 );
 
-admin.use('/api/admin', (req, res, next) => (req.path === '/login' ? next() : requireAdmin(req, res, next)));
+admin.use('/api/admin', (req, res, next) => {
+  if (req.path === '/login') return next();
+  res.set('Cache-Control', 'no-store');
+  if (!allow(`admin:${clientIp(req)}`, 600, 60_000)) return next(new HttpError(429, 'Too many admin requests. Slow down.'));
+  requireAdmin(req, res, next);
+});
+
+/** Ends every admin session (all devices), including this one. */
+admin.post(
+  '/api/admin/logout-all',
+  wrap(async (_req, res) => {
+    const s = await getSettings(true);
+    await audit('logout.all');
+    await updateSettings({ admin_epoch: s.admin_epoch + 1 });
+    res.json({ ok: true });
+  }),
+);
 
 /* ------------------------------------------------------------------ overview */
 admin.get(
@@ -66,6 +100,7 @@ admin.get(
         xLogin: X_LOGIN_READY,
         xApi: X_API_READY,
         voucherSigner: signerAddress(),
+        weakAdminPassword: ADMIN_TOKEN.length < 16,
         chainId: CHAIN.id,
         contracts: { land: LAND_ADDRESS ?? null, city: CITY_ADDRESS ?? null, game: GAME_ADDRESS ?? null, sale: SALE_ADDRESS ?? null },
       },
@@ -103,6 +138,8 @@ admin.put(
     text('share_text', 240);
     text('grab_message', 240);
     if ('referral_points' in b) patch.referral_points = int(b.referral_points, 50, 0, 100000);
+    if ('referral_min_account_days' in b) patch.referral_min_account_days = int(b.referral_min_account_days, 14, 0, 3650);
+    if ('referral_min_followers' in b) patch.referral_min_followers = int(b.referral_min_followers, 3, 0, 1_000_000);
     if ('milestones' in b) {
       if (!Array.isArray(b.milestones)) throw bad('milestones must be a list.');
       patch.milestones = b.milestones
@@ -134,12 +171,92 @@ admin.post(
   '/api/admin/grab/schedule',
   wrap(async (req, res) => {
     const openIn = int(req.body?.open_in_minutes, 0, 0, 60 * 24 * 60);
-    const publicAfter = int(req.body?.public_after_minutes, 60, 0, 60 * 24 * 60);
+    // null = codes only (no public phase until you open it)
+    const codesOnly = req.body?.public_after_minutes === null;
+    const publicAfter = codesOnly ? 0 : int(req.body?.public_after_minutes, 60, 0, 60 * 24 * 60);
     const codeAt = new Date(Date.now() + openIn * 60_000);
-    const publicAt = new Date(codeAt.getTime() + publicAfter * 60_000);
-    const s = await updateSettings({ grab_enabled: true, grab_code_opens_at: codeAt.toISOString(), grab_public_opens_at: publicAt.toISOString() });
-    await audit('grab.schedule', { openIn, publicAfter });
+    const publicAt = codesOnly ? null : new Date(codeAt.getTime() + publicAfter * 60_000).toISOString();
+    const s = await updateSettings({ grab_enabled: true, grab_code_opens_at: codeAt.toISOString(), grab_public_opens_at: publicAt });
+    await audit('grab.schedule', { openIn, publicAfter: codesOnly ? null : publicAfter });
     res.json(grabPhase(s));
+  }),
+);
+
+/**
+ * Grab Land control buttons. Every time is taken from the server clock, so a wrong clock on the admin's
+ * computer can never open the sale early or late.
+ */
+admin.post(
+  '/api/admin/grab/action',
+  wrap(async (req, res) => {
+    const action = str(req.body?.action, 20);
+    const s = await getSettings(true);
+    const now = Date.now();
+    const iso = (t: number) => new Date(t).toISOString();
+    const codeAt = s.grab_code_opens_at ? Date.parse(s.grab_code_opens_at) : NaN;
+    const publicAt = s.grab_public_opens_at ? Date.parse(s.grab_public_opens_at) : NaN;
+    let patch: Partial<Settings>;
+    switch (action) {
+      case 'pause':
+        patch = { grab_enabled: false };
+        break;
+      case 'resume':
+        if (!Number.isFinite(codeAt)) throw bad('Set a timer first.');
+        patch = { grab_enabled: true };
+        break;
+      case 'reset':
+        patch = { grab_enabled: false, grab_code_opens_at: null, grab_public_opens_at: null };
+        break;
+      case 'open_code_now':
+        patch = { grab_enabled: true, grab_code_opens_at: iso(now), grab_public_opens_at: Number.isFinite(publicAt) && publicAt > now ? s.grab_public_opens_at : null };
+        break;
+      case 'open_public_now':
+        patch = { grab_enabled: true, grab_code_opens_at: Number.isFinite(codeAt) && codeAt <= now ? s.grab_code_opens_at : iso(now), grab_public_opens_at: iso(now) };
+        break;
+      case 'codes_only':
+        patch = { grab_public_opens_at: null };
+        break;
+      case 'shift': {
+        // move the upcoming times by N minutes (negative = sooner), never into the past
+        const mins = int(req.body?.minutes, 0, -60 * 24 * 30, 60 * 24 * 30);
+        if (!mins) throw bad('minutes is required.');
+        if (!(codeAt > now) && !(publicAt > now)) throw bad('Nothing upcoming to move. Start a timer first.');
+        const move = (t: number) => (t > now ? iso(Math.max(now, t + mins * 60_000)) : undefined);
+        patch = {};
+        const c = move(codeAt);
+        const p = move(publicAt);
+        if (c) patch.grab_code_opens_at = c;
+        if (p) patch.grab_public_opens_at = p;
+        const nc = Date.parse(patch.grab_code_opens_at ?? s.grab_code_opens_at ?? '');
+        const np = Date.parse(patch.grab_public_opens_at ?? s.grab_public_opens_at ?? '');
+        if (Number.isFinite(nc) && Number.isFinite(np) && np < nc) patch.grab_public_opens_at = iso(nc);
+        break;
+      }
+      default:
+        throw bad('Unknown action.');
+    }
+    const next = await updateSettings(patch);
+    await audit(`grab.${action}`, { ...patch, minutes: req.body?.minutes });
+    res.json({ grab: grabPhase(next), settings: next });
+  }),
+);
+
+/** Live numbers for the Grab Land control center. */
+admin.get(
+  '/api/admin/grab/stats',
+  wrap(async (_req, res) => {
+    const ago = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const [entries, entriesHour, passes10m, codesUnused, codesClaimed, codesRevoked, wallets] = await Promise.all([
+      db.count('grab_entries'),
+      db.count('grab_entries', { entered_at: { gte: ago(3600_000) } }),
+      db.count('grab_entries', { last_voucher_at: { gte: ago(10 * 60_000) } }),
+      db.count('grab_codes', { status: 'unused' }),
+      db.count('grab_codes', { status: 'claimed' }),
+      db.count('grab_codes', { status: 'revoked' }),
+      db.count('grab_wallets'),
+    ]);
+    const tk = await getTokenomics().catch(() => null);
+    res.json({ entries, entriesHour, passes10m, codes: { unused: codesUnused, claimed: codesClaimed, revoked: codesRevoked }, wallets, tokenomics: tk });
   }),
 );
 
@@ -213,7 +330,11 @@ admin.get(
   wrap(async (req, res) => {
     const batch = str(req.query.batch, 60);
     const rows = await db.select<GrabCode>('grab_codes', { where: batch ? { batch } : {}, order: [['created_at', 'asc']], limit: 100000 });
-    const cell = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    // quote every cell, and stop spreadsheet formulas (=, +, -, @) from running when the file is opened
+    const cell = (v: unknown) => {
+      const t = String(v ?? '');
+      return `"${(/^[=+\-@\t\r]/.test(t) ? `'${t}` : t).replace(/"/g, '""')}"`;
+    };
     const csv = ['code,label,batch,status,wallet,claimed_at,created_at', ...rows.map((r) => [r.code, r.label, r.batch, r.status, r.wallet, r.claimed_at, r.created_at].map(cell).join(','))].join('\n');
     res.set('Content-Type', 'text/csv; charset=utf-8').set('Content-Disposition', `attachment; filename="cityhood-codes${batch ? `-${batch}` : ''}.csv"`).send(csv);
   }),
@@ -384,6 +505,11 @@ function taskInput(b: Record<string, unknown>, partial: boolean) {
   if ('required_text' in b) t.required_text = str(b.required_text, 80) || null;
   if (!partial || 'active' in b) t.active = 'active' in b ? bool(b.active) : true;
   if (!partial || 'sort' in b) t.sort = int(b.sort, 100, 0, 100000);
+  // a "visit" task is just opening a link: it needs the link, and X can't verify it
+  if (t.kind === 'visit') {
+    if (!partial && !t.target_url) throw bad('A visit task needs the link people should open.');
+    if (t.verify_mode === 'x_api') t.verify_mode = 'auto';
+  }
   for (const k of ['starts_at', 'ends_at']) {
     if (!(k in b)) continue;
     t[k] = b[k] ? (Number.isFinite(Date.parse(String(b[k]))) ? new Date(String(b[k])).toISOString() : null) : null;

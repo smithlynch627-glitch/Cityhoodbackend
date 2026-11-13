@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 import type { NextFunction, Request, Response } from 'express';
 import { IS_PROD, SESSION_SECRET } from './config';
 
@@ -73,13 +74,43 @@ export function allow(key: string, limit: number, windowMs: number) {
   b.n++;
   return b.n <= limit;
 }
+/** How many hits `key` has in its current window (without adding one). */
+export function hits(key: string) {
+  const b = buckets.get(key);
+  return b && b.reset >= Date.now() ? b.n : 0;
+}
 export function retryAfter(key: string) {
   const b = buckets.get(key);
   return b ? Math.max(1, Math.ceil((b.reset - Date.now()) / 1000)) : 0;
 }
 
+/**
+ * The visitor's IP, for rate limits. Behind Railway, `req.ip` with `trust proxy = 1` can be one of Railway's own
+ * proxy hops, which would make every visitor look like the same person. Railway's edge removes any
+ * X-Forwarded-For a client sends and puts the real client first, so on Railway (or with TRUST_PROXY_HEADERS=1)
+ * the first entry is used. IPv6 visitors are grouped by their /64 network, since one device can rotate addresses
+ * inside it. Anywhere else the direct connection address is used, because the headers could be faked there.
+ */
+const TRUST_HEADERS = !!process.env.RAILWAY_ENVIRONMENT || process.env.TRUST_PROXY_HEADERS === '1';
 export function clientIp(req: Request) {
-  return (req.ip || req.socket.remoteAddress || 'unknown').replace(/^::ffff:/, '');
+  let ip = '';
+  if (TRUST_HEADERS) {
+    const first = String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim();
+    const real = String(req.headers['x-real-ip'] ?? '').trim();
+    ip = isIP(first) ? first : isIP(real) ? real : '';
+  }
+  if (!ip) ip = req.socket.remoteAddress || req.ip || 'unknown';
+  ip = ip.replace(/^::ffff:/, '');
+  if (isIP(ip) === 6) ip = `${ipv6Groups(ip).slice(0, 4).join(':')}::/64`;
+  return ip;
+}
+/** the 8 groups of an IPv6 address, with :: expanded */
+function ipv6Groups(ip: string) {
+  const [head, tail = ''] = ip.split('::');
+  const a = head ? head.split(':') : [];
+  const b = ip.includes('::') && tail ? tail.split(':') : [];
+  const groups = ip.includes('::') ? [...a, ...Array(Math.max(0, 8 - a.length - b.length)).fill('0'), ...b] : a;
+  return groups.map((g) => (g.includes('.') ? g : g.replace(/^0+(?=.)/, '').toLowerCase()));
 }
 
 /** Express middleware: `limit` requests per `windowMs` per IP for this route group. */

@@ -65,7 +65,7 @@ export const X_CALLBACK_URL = (env.X_CALLBACK_URL || `${(env.PUBLIC_API_URL || `
 /** Optional app bearer token for automatic task checks through the X API (needs a paid X API tier). */
 export const X_BEARER_TOKEN = env.X_BEARER_TOKEN || '';
 /** Default project X handle (can be changed in the admin panel). */
-export const X_HANDLE = (env.X_HANDLE || 'cityhood').replace(/^@/, '');
+export const X_HANDLE = (env.X_HANDLE || 'CityHood_NFT').replace(/^@/, '');
 
 export const SUPABASE_URL = env.SUPABASE_URL || '';
 export const SUPABASE_KEY = env.SUPABASE_SERVICE_ROLE_KEY || '';

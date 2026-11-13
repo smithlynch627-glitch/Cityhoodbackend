@@ -1,9 +1,10 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import cors from 'cors';
+import compression from 'compression';
 import { CHAIN, CITY_ADDRESS, CONTRACTS_READY, CORS_ORIGIN, GAME_ADDRESS, GAME_READY, IS_PROD, LAND_ADDRESS, NFT_READY, PORT, PUBLIC_API_URL, SALE_ADDRESS, SITE_URL } from './config';
 import { chainStats, snapshot } from './chain';
 import { indexerState, startIndexer } from './indexer';
-import { development, landPng, landSvg, metadataFor, sampleCity } from './render';
+import { development, landPngAsync, landSvg, metadataFor, sampleCity } from './render';
 import { store } from './store';
 import { db } from './db';
 import { DEFAULT_CATALOG } from './shared/economy';
@@ -15,6 +16,7 @@ import { market } from './market';
 import { admin, requireAdmin } from './admin';
 import { startJobs } from './jobs';
 import { HttpError } from './security';
+import { TtlCache } from './cache';
 import tokenomics from './shared/tokenomics.json';
 
 const app = express();
@@ -24,6 +26,7 @@ app.use((_req, res, next) => {
   res.set('X-Content-Type-Options', 'nosniff');
   res.set('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.set('X-Frame-Options', 'DENY');
+  if (IS_PROD) res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   next();
 });
 // NFT metadata and images are public (wallets and marketplaces read them from anywhere). Everything else
@@ -40,6 +43,8 @@ app.use(
     }),
   ),
 );
+// gzip JSON and HTML (images are already compressed)
+app.use(compression({ threshold: 1024, filter: (req, res) => !/^image\//.test(String(res.getHeader('Content-Type') ?? '')) && compression.filter(req, res) }));
 app.use(express.json({ limit: '64kb' }));
 app.use(citizens);
 app.use(share);
@@ -48,14 +53,12 @@ app.use(market);
 app.use(admin);
 
 /* ------------------------------ tiny TTL cache ------------------------------ */
-const cache = new Map<string, { at: number; value: unknown }>();
-async function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
-  const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < ttlMs) return hit.value as T;
-  const value = await fn();
-  if (cache.size > 2000) cache.clear();
-  cache.set(key, { at: Date.now(), value });
-  return value;
+const cache = new TtlCache<unknown>(4000);
+/** rendered images are big, so they get their own, smaller cache */
+const images = new TtlCache<unknown>(250);
+function cached<T>(key: string, ttlMs: number, fn: () => Promise<T> | T): Promise<T> {
+  const c = key.startsWith('png:') || key.startsWith('svg:') || key === 'collection' ? images : cache;
+  return c.get(key, ttlMs, fn) as Promise<T>;
 }
 
 const wrap = (fn: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) => fn(req, res).catch(next);
@@ -156,7 +159,7 @@ app.post(
       }
     }
     const row = await store.addAnnouncement({ title, body, link });
-    [...cache.keys()].filter((k) => k.startsWith('news:')).forEach((k) => cache.delete(k));
+    cache.deletePrefix('news:');
     res.status(201).json(row);
   }),
 );
@@ -168,7 +171,7 @@ app.delete(
     const id = Number.parseInt(String(req.params.id), 10);
     if (!Number.isFinite(id) || id < 1) return res.status(400).json({ error: 'Invalid id' });
     const ok = await store.deleteAnnouncement(id);
-    [...cache.keys()].filter((k) => k.startsWith('news:')).forEach((k) => cache.delete(k));
+    cache.deletePrefix('news:');
     if (!ok) return res.status(404).json({ error: 'Not found' });
     res.json({ ok: true });
   }),
@@ -208,7 +211,7 @@ app.get(
     if (!snap) return res.status(404).json({ error: 'Land not minted' });
     const stateKey = `${snap.land.buildings.length}:${snap.land.score}:${snap.hallLevelNow}:${snap.land.buildings.filter((b) => b.busy && b.readyAt > snap.chainTime).length}`;
     if (png) {
-      const buf = await cached(`png:${id}:${stateKey}`, 10 * 60_000, async () => landPng(landSvg(id, snap.land, snap.chainTime, false)));
+      const buf = await cached(`png:${id}:${stateKey}`, 10 * 60_000, () => landPngAsync(landSvg(id, snap.land, snap.chainTime, false)));
       res.set('Content-Type', 'image/png').set('Cache-Control', 'public, max-age=120').send(buf);
     } else {
       const svg = await cached(`svg:${id}:${stateKey}`, 10 * 60_000, async () => landSvg(id, snap.land, snap.chainTime, true));
@@ -231,7 +234,7 @@ app.get('/api/contract-metadata', (_req, res) => {
 app.get(
   '/api/collection.png',
   wrap(async (_req, res) => {
-    const buf = await cached('collection', 24 * 3600_000, async () => landPng(landSvg(7, sampleCity(), 1, false), 800));
+    const buf = await cached('collection', 24 * 3600_000, () => landPngAsync(landSvg(7, sampleCity(), 1, false), 800));
     res.set('Content-Type', 'image/png').set('Cache-Control', 'public, max-age=86400').send(buf);
   }),
 );
@@ -244,7 +247,7 @@ app.use((err: Error & { status?: number }, _req: Request, res: Response, _next: 
   res.status(status).json({ error: status >= 500 ? 'Server error' : err.message });
 });
 
-app.listen(PORT, (err?: Error) => {
+const server = app.listen(PORT, (err?: Error) => {
   if (err) {
     console.error(`[api] could not listen on :${PORT}: ${err.message}`);
     process.exit(1);
@@ -254,4 +257,8 @@ app.listen(PORT, (err?: Error) => {
   void seedTasks().catch((e) => console.error('[tasks] seed failed:', e instanceof Error ? e.message : e));
   startJobs();
 });
+// keep connections from Railway's proxy open longer than the proxy does, so busy minutes don't turn into 502s
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+server.requestTimeout = 30_000;
 void HttpError;

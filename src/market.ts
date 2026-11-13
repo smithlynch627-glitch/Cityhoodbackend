@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { TtlCache } from './cache';
 import { formatEther, parseAbi, zeroAddress, type Address } from 'viem';
 import { client } from './chain';
 import { CityGameAbi, CityLandAbi, CitySaleAbi, CityTokenAbi } from './abi';
@@ -44,10 +45,21 @@ const read = <T>(address: Address | undefined, abi: unknown, functionName: strin
     ? (client.readContract({ address, abi: abi as never, functionName: functionName as never, args: args as never }) as Promise<T>).catch(() => null as T | null)
     : Promise.resolve(null as T | null);
 
-let cache: { at: number; value: unknown } | null = null;
+const tkCache = new TtlCache<unknown>(1);
+let lastGood: unknown = null;
 
+/** Sale + token numbers, refreshed at most every 20 s however many people ask (one chain read for all). */
 export async function getTokenomics() {
-  if (cache && Date.now() - cache.at < 20_000) return cache.value;
+  try {
+    lastGood = await tkCache.get('tk', 20_000, buildTokenomics);
+    return lastGood;
+  } catch (e) {
+    if (lastGood) return lastGood; // the RPC hiccuped: keep showing the last numbers
+    throw e;
+  }
+}
+
+async function buildTokenomics() {
   const total = BigInt(tokenomics.totalSupply) * 10n ** 18n;
   const [supply, pair, buyTax, sellTax, trading, limits, maxTx, maxWallet, taxCollected, saleInfo, pools, minted, maxLands, eth] = await Promise.all([
     read<bigint>(CITY_ADDRESS, CityTokenAbi, 'totalSupply'),
@@ -149,7 +161,6 @@ export async function getTokenomics() {
     lands: { minted: minted ? Number(minted) : 0, maxSupply: maxLands ? Number(maxLands) : tokenomics.land.maxSupply },
     updatedAt: new Date().toISOString(),
   };
-  cache = { at: Date.now(), value };
   return value;
 }
 
